@@ -40,6 +40,7 @@
 #include "google_breakpad/processor/memory_region.h"
 #include "google_breakpad/processor/source_line_resolver_interface.h"
 #include "google_breakpad/processor/stack_frame_cpu.h"
+#include "google_breakpad/processor/system_info.h"
 #include "processor/cfi_frame_info.h"
 #include "processor/logging.h"
 #include "processor/stackwalker_arm.h"
@@ -77,7 +78,7 @@ StackFrame* StackwalkerARM::GetContextFrame() {
 }
 
 StackFrameARM* StackwalkerARM::GetCallerByCFIFrameInfo(
-    const vector<StackFrame*> &frames,
+    const vector<StackFrame*>& frames,
     CFIFrameInfo* cfi_frame_info) {
   StackFrameARM* last_frame = static_cast<StackFrameARM*>(frames.back());
 
@@ -161,7 +162,7 @@ StackFrameARM* StackwalkerARM::GetCallerByCFIFrameInfo(
 }
 
 StackFrameARM* StackwalkerARM::GetCallerByStackScan(
-    const vector<StackFrame*> &frames) {
+    const vector<StackFrame*>& frames) {
   StackFrameARM* last_frame = static_cast<StackFrameARM*>(frames.back());
   uint32_t last_sp = last_frame->context.iregs[MD_CONTEXT_ARM_REG_SP];
   uint32_t caller_sp, caller_pc;
@@ -192,7 +193,7 @@ StackFrameARM* StackwalkerARM::GetCallerByStackScan(
 }
 
 StackFrameARM* StackwalkerARM::GetCallerByFramePointer(
-    const vector<StackFrame*> &frames) {
+    const vector<StackFrame*>& frames) {
   StackFrameARM* last_frame = static_cast<StackFrameARM*>(frames.back());
 
   if (!(last_frame->context_validity &
@@ -244,15 +245,19 @@ StackFrame* StackwalkerARM::GetCallerFrame(const CallStack* stack,
     return NULL;
   }
 
-  const vector<StackFrame*> &frames = *stack->frames();
+  const vector<StackFrame*>& frames = *stack->frames();
   StackFrameARM* last_frame = static_cast<StackFrameARM*>(frames.back());
   scoped_ptr<StackFrameARM> frame;
 
   // See if there is DWARF call frame information covering this address.
-  scoped_ptr<CFIFrameInfo> cfi_frame_info(
-      frame_symbolizer_->FindCFIFrameInfo(last_frame));
-  if (cfi_frame_info.get())
-    frame.reset(GetCallerByCFIFrameInfo(frames, cfi_frame_info.get()));
+  // TODO(jperaza): Ignore iOS CFI info until it is properly collected.
+  // https://bugs.chromium.org/p/google-breakpad/issues/detail?id=764
+  if (!system_info_ || system_info_->os != "iOS") {
+    scoped_ptr<CFIFrameInfo> cfi_frame_info(
+        frame_symbolizer_->FindCFIFrameInfo(last_frame));
+    if (cfi_frame_info.get())
+      frame.reset(GetCallerByCFIFrameInfo(frames, cfi_frame_info.get()));
+  }
 
   // If CFI failed, or there wasn't CFI available, fall back
   // to frame pointer, if this is configured.

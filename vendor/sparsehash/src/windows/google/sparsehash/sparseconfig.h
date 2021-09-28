@@ -7,10 +7,10 @@
 #define GOOGLE_NAMESPACE  ::google
 
 /* the location of the header defining hash functions */
-#define HASH_FUN_H  <unordered_map>
+#define HASH_FUN_H  <hash_map>
 
 /* the namespace of the hash<> function */
-#define HASH_NAMESPACE  std
+#define HASH_NAMESPACE  stdext
 
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
@@ -37,10 +37,10 @@
 #define HAVE___UINT16  1
 
 /* The system-provided hash function including the namespace. */
-#define SPARSEHASH_HASH  HASH_NAMESPACE::hash
+#define SPARSEHASH_HASH  HASH_NAMESPACE::hash_compare
 
 /* The system-provided hash function, in namespace HASH_NAMESPACE. */
-#define SPARSEHASH_HASH_NO_NAMESPACE  hash
+#define SPARSEHASH_HASH_NO_NAMESPACE  hash_compare
 
 /* Stops putting the code inside the Google namespace */
 #define _END_GOOGLE_NAMESPACE_  }

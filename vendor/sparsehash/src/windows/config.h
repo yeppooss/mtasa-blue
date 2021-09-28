@@ -6,26 +6,53 @@
 /* Namespace for Google classes */
 #define GOOGLE_NAMESPACE  ::google
 
+#if (_MSC_VER >= 1800 )
+
 /* the location of the header defining hash functions */
 #define HASH_FUN_H  <unordered_map>
 
 /* the location of <unordered_map> or <hash_map> */
 #define HASH_MAP_H  <unordered_map>
 
-/* the namespace of the hash<> function */
-#define HASH_NAMESPACE  std
-
 /* the location of <unordered_set> or <hash_set> */
 #define HASH_SET_H  <unordered_set>
 
-/* Define to 1 if you have the <google/malloc_extension.h> header file. */
-#undef HAVE_GOOGLE_MALLOC_EXTENSION_H
+/* define if the compiler has hash_map */
+#define HAVE_HASH_MAP  0
+
+/* define if the compiler has hash_set */
+#define HAVE_HASH_SET  0
+
+/* define if the compiler supports unordered_{map,set} */
+#define HAVE_UNORDERED_MAP 1
+
+#else /* Earlier than VSC++ 2013 */ 
+
+/* the location of the header defining hash functions */
+#define HASH_FUN_H  <hash_map>
+
+/* the location of <unordered_map> or <hash_map> */
+#define HASH_MAP_H  <hash_map>
+
+/* the location of <unordered_set> or <hash_set> */
+#define HASH_SET_H  <hash_set>
 
 /* define if the compiler has hash_map */
 #define HAVE_HASH_MAP  1
 
 /* define if the compiler has hash_set */
 #define HAVE_HASH_SET  1
+
+/* define if the compiler supports unordered_{map,set} */
+#undef HAVE_UNORDERED_MAP
+
+#endif
+
+/* the namespace of the hash<> function */
+#define HASH_NAMESPACE  stdext
+
+/* Define to 1 if you have the <google/malloc_extension.h> header file. */
+#undef HAVE_GOOGLE_MALLOC_EXTENSION_H
 
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
@@ -81,9 +108,6 @@
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H
 
-/* define if the compiler supports unordered_{map,set} */
-#undef HAVE_UNORDERED_MAP
-
 /* Define to 1 if the system has the type `u_int16_t'. */
 #undef HAVE_U_INT16_T
 
@@ -116,10 +140,10 @@
 #undef PTHREAD_CREATE_JOINABLE
 
 /* The system-provided hash function including the namespace. */
-#define SPARSEHASH_HASH  HASH_NAMESPACE::hash
+#define SPARSEHASH_HASH  HASH_NAMESPACE::hash_compare
 
 /* The system-provided hash function, in namespace HASH_NAMESPACE. */
-#define SPARSEHASH_HASH_NO_NAMESPACE  hash
+#define SPARSEHASH_HASH_NO_NAMESPACE  hash_compare
 
 /* Define to 1 if you have the ANSI C header files. */
 #define STDC_HEADERS  1

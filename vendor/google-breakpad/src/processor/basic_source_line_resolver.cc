@@ -62,7 +62,43 @@ namespace google_breakpad {
 #define strtoull _strtoui64
 #endif
 
-static const char *kWhitespace = " \r\n";
+namespace {
+
+// Utility function to tokenize given the presence of an optional initial
+// field. In this case, optional_field is the expected string for the optional
+// field, and max_tokens is the maximum number of tokens including the optional
+// field. Refer to the documentation for Tokenize for descriptions of the other
+// arguments.
+bool TokenizeWithOptionalField(char* line,
+                               const char* optional_field,
+                               const char* separators,
+                               int max_tokens,
+                               vector<char*>* tokens) {
+  // First tokenize assuming the optional field is not present.  If we then see
+  // the optional field, additionally tokenize the last token into two tokens.
+  if (!Tokenize(line, separators, max_tokens - 1, tokens)) {
+    return false;
+  }
+
+  if (strcmp(tokens->front(), optional_field) == 0) {
+    // The optional field is present. Split the last token in two to recover the
+    // field prior to the last.
+    vector<char*> last_tokens;
+    if (!Tokenize(tokens->back(), separators, 2, &last_tokens)) {
+      return false;
+    }
+    // Replace the previous last token with the two new tokens.
+    tokens->pop_back();
+    tokens->push_back(last_tokens[0]);
+    tokens->push_back(last_tokens[1]);
+  }
+
+  return true;
+}
+
+}  // namespace
+
+static const char* kWhitespace = " \r\n";
 static const int kMaxErrorsPrinted = 5;
 static const int kMaxErrorsBeforeBailing = 100;
 
@@ -71,9 +107,9 @@ BasicSourceLineResolver::BasicSourceLineResolver() :
 
 // static
 void BasicSourceLineResolver::Module::LogParseError(
-   const string &message,
+   const string& message,
    int line_number,
-   int *num_errors) {
+   int* num_errors) {
   if (++(*num_errors) <= kMaxErrorsPrinted) {
     if (line_number > 0) {
       BPLOG(ERROR) << "Line " << line_number << ": " << message;
@@ -84,12 +120,12 @@ void BasicSourceLineResolver::Module::LogParseError(
 }
 
 bool BasicSourceLineResolver::Module::LoadMapFromMemory(
-    char *memory_buffer,
+    char* memory_buffer,
     size_t memory_buffer_size) {
   linked_ptr<Function> cur_func;
   int line_number = 0;
   int num_errors = 0;
-  char *save_ptr;
+  char* save_ptr;
 
   // If the length is 0, we can still pretend we have a symbol file. This is
   // for scenarios that want to test symbol lookup, but don't necessarily care
@@ -124,7 +160,7 @@ bool BasicSourceLineResolver::Module::LoadMapFromMemory(
        &num_errors);
   }
 
-  char *buffer;
+  char* buffer;
   buffer = strtok_r(memory_buffer, "\r\n", &save_ptr);
 
   while (buffer != NULL) {
@@ -171,7 +207,7 @@ bool BasicSourceLineResolver::Module::LoadMapFromMemory(
         LogParseError("Found source line data without a function",
                        line_number, &num_errors);
       } else {
-        Line *line = ParseLine(buffer);
+        Line* line = ParseLine(buffer);
         if (!line) {
           LogParseError("ParseLine failed", line_number, &num_errors);
         } else {
@@ -189,7 +225,7 @@ bool BasicSourceLineResolver::Module::LoadMapFromMemory(
   return true;
 }
 
-void BasicSourceLineResolver::Module::LookupAddress(StackFrame *frame) const {
+void BasicSourceLineResolver::Module::LookupAddress(StackFrame* frame) const {
   MemAddr address = frame->instruction - frame->module->base_address();
 
   // First, look for a FUNC record that covers address. Use
@@ -228,8 +264,8 @@ void BasicSourceLineResolver::Module::LookupAddress(StackFrame *frame) const {
   }
 }
 
-WindowsFrameInfo *BasicSourceLineResolver::Module::FindWindowsFrameInfo(
-    const StackFrame *frame) const {
+WindowsFrameInfo* BasicSourceLineResolver::Module::FindWindowsFrameInfo(
+    const StackFrame* frame) const {
   MemAddr address = frame->instruction - frame->module->base_address();
   scoped_ptr<WindowsFrameInfo> result(new WindowsFrameInfo());
 
@@ -277,8 +313,8 @@ WindowsFrameInfo *BasicSourceLineResolver::Module::FindWindowsFrameInfo(
   return NULL;
 }
 
-CFIFrameInfo *BasicSourceLineResolver::Module::FindCFIFrameInfo(
-    const StackFrame *frame) const {
+CFIFrameInfo* BasicSourceLineResolver::Module::FindCFIFrameInfo(
+    const StackFrame* frame) const {
   MemAddr address = frame->instruction - frame->module->base_address();
   MemAddr initial_base, initial_size;
   string initial_rules;
@@ -311,9 +347,9 @@ CFIFrameInfo *BasicSourceLineResolver::Module::FindCFIFrameInfo(
   return rules.release();
 }
 
-bool BasicSourceLineResolver::Module::ParseFile(char *file_line) {
+bool BasicSourceLineResolver::Module::ParseFile(char* file_line) {
   long index;
-  char *filename;
+  char* filename;
   if (SymbolParseHelper::ParseFile(file_line, &index, &filename)) {
     files_.insert(make_pair(index, string(filename)));
     return true;
@@ -322,20 +358,21 @@ bool BasicSourceLineResolver::Module::ParseFile(char *file_line) {
 }
 
 BasicSourceLineResolver::Function*
-BasicSourceLineResolver::Module::ParseFunction(char *function_line) {
+BasicSourceLineResolver::Module::ParseFunction(char* function_line) {
+  bool is_multiple;
   uint64_t address;
   uint64_t size;
   long stack_param_size;
-  char *name;
-  if (SymbolParseHelper::ParseFunction(function_line, &address, &size,
-                                       &stack_param_size, &name)) {
-    return new Function(name, address, size, stack_param_size);
+  char* name;
+  if (SymbolParseHelper::ParseFunction(function_line, &is_multiple, &address,
+                                       &size, &stack_param_size, &name)) {
+    return new Function(name, address, size, stack_param_size, is_multiple);
   }
   return NULL;
 }
 
 BasicSourceLineResolver::Line* BasicSourceLineResolver::Module::ParseLine(
-    char *line_line) {
+    char* line_line) {
   uint64_t address;
   uint64_t size;
   long line_number;
@@ -348,12 +385,13 @@ BasicSourceLineResolver::Line* BasicSourceLineResolver::Module::ParseLine(
   return NULL;
 }
 
-bool BasicSourceLineResolver::Module::ParsePublicSymbol(char *public_line) {
+bool BasicSourceLineResolver::Module::ParsePublicSymbol(char* public_line) {
+  bool is_multiple;
   uint64_t address;
   long stack_param_size;
-  char *name;
+  char* name;
 
-  if (SymbolParseHelper::ParsePublicSymbol(public_line, &address,
+  if (SymbolParseHelper::ParsePublicSymbol(public_line, &is_multiple, &address,
                                            &stack_param_size, &name)) {
     // A few public symbols show up with an address of 0.  This has been seen
     // in the dumped output of ntdll.pdb for symbols such as _CIlog, _CIpow,
@@ -366,13 +404,14 @@ bool BasicSourceLineResolver::Module::ParsePublicSymbol(char *public_line) {
     }
 
     linked_ptr<PublicSymbol> symbol(new PublicSymbol(name, address,
-                                                     stack_param_size));
+                                                     stack_param_size,
+                                                     is_multiple));
     return public_symbols_.Store(address, symbol);
   }
   return false;
 }
 
-bool BasicSourceLineResolver::Module::ParseStackInfo(char *stack_info_line) {
+bool BasicSourceLineResolver::Module::ParseStackInfo(char* stack_info_line) {
   // Skip "STACK " prefix.
   stack_info_line += 6;
 
@@ -380,7 +419,7 @@ bool BasicSourceLineResolver::Module::ParseStackInfo(char *stack_info_line) {
   // information this is.
   while (*stack_info_line == ' ')
     stack_info_line++;
-  const char *platform = stack_info_line;
+  const char* platform = stack_info_line;
   while (!strchr(kWhitespace, *stack_info_line))
     stack_info_line++;
   *stack_info_line++ = '\0';
@@ -429,23 +468,23 @@ bool BasicSourceLineResolver::Module::ParseStackInfo(char *stack_info_line) {
 }
 
 bool BasicSourceLineResolver::Module::ParseCFIFrameInfo(
-    char *stack_info_line) {
-  char *cursor;
+    char* stack_info_line) {
+  char* cursor;
 
   // Is this an INIT record or a delta record?
-  char *init_or_address = strtok_r(stack_info_line, " \r\n", &cursor);
+  char* init_or_address = strtok_r(stack_info_line, " \r\n", &cursor);
   if (!init_or_address)
     return false;
 
   if (strcmp(init_or_address, "INIT") == 0) {
     // This record has the form "STACK INIT <address> <size> <rules...>".
-    char *address_field = strtok_r(NULL, " \r\n", &cursor);
+    char* address_field = strtok_r(NULL, " \r\n", &cursor);
     if (!address_field) return false;
 
-    char *size_field = strtok_r(NULL, " \r\n", &cursor);
+    char* size_field = strtok_r(NULL, " \r\n", &cursor);
     if (!size_field) return false;
 
-    char *initial_rules = strtok_r(NULL, "\r\n", &cursor);
+    char* initial_rules = strtok_r(NULL, "\r\n", &cursor);
     if (!initial_rules) return false;
 
     MemAddr address = strtoul(address_field, NULL, 16);
@@ -455,8 +494,8 @@ bool BasicSourceLineResolver::Module::ParseCFIFrameInfo(
   }
 
   // This record has the form "STACK <address> <rules...>".
-  char *address_field = init_or_address;
-  char *delta_rules = strtok_r(NULL, "\r\n", &cursor);
+  char* address_field = init_or_address;
+  char* delta_rules = strtok_r(NULL, "\r\n", &cursor);
   if (!delta_rules) return false;
   MemAddr address = strtoul(address_field, NULL, 16);
   cfi_delta_rules_[address] = delta_rules;
@@ -464,8 +503,8 @@ bool BasicSourceLineResolver::Module::ParseCFIFrameInfo(
 }
 
 // static
-bool SymbolParseHelper::ParseFile(char *file_line, long *index,
-                                  char **filename) {
+bool SymbolParseHelper::ParseFile(char* file_line, long* index,
+                                  char** filename) {
   // FILE <id> <filename>
   assert(strncmp(file_line, "FILE ", 5) == 0);
   file_line += 5;  // skip prefix
@@ -475,7 +514,7 @@ bool SymbolParseHelper::ParseFile(char *file_line, long *index,
     return false;
   }
 
-  char *after_number;
+  char* after_number;
   *index = strtol(tokens[0], &after_number, 10);
   if (!IsValidAfterNumber(after_number) || *index < 0 ||
       *index == std::numeric_limits<long>::max()) {
@@ -491,51 +530,54 @@ bool SymbolParseHelper::ParseFile(char *file_line, long *index,
 }
 
 // static
-bool SymbolParseHelper::ParseFunction(char *function_line, uint64_t *address,
-                                      uint64_t *size, long *stack_param_size,
-                                      char **name) {
-  // FUNC <address> <size> <stack_param_size> <name>
+bool SymbolParseHelper::ParseFunction(char* function_line, bool* is_multiple,
+                                      uint64_t* address, uint64_t* size,
+                                      long* stack_param_size, char** name) {
+  // FUNC [<multiple>] <address> <size> <stack_param_size> <name>
   assert(strncmp(function_line, "FUNC ", 5) == 0);
   function_line += 5;  // skip prefix
 
   vector<char*> tokens;
-  if (!Tokenize(function_line, kWhitespace, 4, &tokens)) {
+  if (!TokenizeWithOptionalField(function_line, "m", kWhitespace, 5, &tokens)) {
     return false;
   }
 
-  char *after_number;
-  *address = strtoull(tokens[0], &after_number, 16);
+  *is_multiple = strcmp(tokens[0], "m") == 0;
+  int next_token = *is_multiple ? 1 : 0;
+
+  char* after_number;
+  *address = strtoull(tokens[next_token++], &after_number, 16);
   if (!IsValidAfterNumber(after_number) ||
       *address == std::numeric_limits<unsigned long long>::max()) {
     return false;
   }
-  *size = strtoull(tokens[1], &after_number, 16);
+  *size = strtoull(tokens[next_token++], &after_number, 16);
   if (!IsValidAfterNumber(after_number) ||
       *size == std::numeric_limits<unsigned long long>::max()) {
     return false;
   }
-  *stack_param_size = strtol(tokens[2], &after_number, 16);
+  *stack_param_size = strtol(tokens[next_token++], &after_number, 16);
   if (!IsValidAfterNumber(after_number) ||
       *stack_param_size == std::numeric_limits<long>::max() ||
       *stack_param_size < 0) {
     return false;
   }
-  *name = tokens[3];
+  *name = tokens[next_token++];
 
   return true;
 }
 
 // static
-bool SymbolParseHelper::ParseLine(char *line_line, uint64_t *address,
-                                  uint64_t *size, long *line_number,
-                                  long *source_file) {
+bool SymbolParseHelper::ParseLine(char* line_line, uint64_t* address,
+                                  uint64_t* size, long* line_number,
+                                  long* source_file) {
   // <address> <size> <line number> <source file id>
   vector<char*> tokens;
   if (!Tokenize(line_line, kWhitespace, 4, &tokens)) {
     return false;
   }
 
-  char *after_number;
+  char* after_number;
   *address  = strtoull(tokens[0], &after_number, 16);
   if (!IsValidAfterNumber(after_number) ||
       *address == std::numeric_limits<unsigned long long>::max()) {
@@ -571,38 +613,41 @@ bool SymbolParseHelper::ParseLine(char *line_line, uint64_t *address,
 }
 
 // static
-bool SymbolParseHelper::ParsePublicSymbol(char *public_line,
-                                          uint64_t *address,
-                                          long *stack_param_size,
-                                          char **name) {
-  // PUBLIC <address> <stack_param_size> <name>
+bool SymbolParseHelper::ParsePublicSymbol(char* public_line, bool* is_multiple,
+                                          uint64_t* address,
+                                          long* stack_param_size,
+                                          char** name) {
+  // PUBLIC [<multiple>] <address> <stack_param_size> <name>
   assert(strncmp(public_line, "PUBLIC ", 7) == 0);
   public_line += 7;  // skip prefix
 
   vector<char*> tokens;
-  if (!Tokenize(public_line, kWhitespace, 3, &tokens)) {
+  if (!TokenizeWithOptionalField(public_line, "m", kWhitespace, 4, &tokens)) {
     return false;
   }
 
-  char *after_number;
-  *address = strtoull(tokens[0], &after_number, 16);
+  *is_multiple = strcmp(tokens[0], "m") == 0;
+  int next_token = *is_multiple ? 1 : 0;
+
+  char* after_number;
+  *address = strtoull(tokens[next_token++], &after_number, 16);
   if (!IsValidAfterNumber(after_number) ||
       *address == std::numeric_limits<unsigned long long>::max()) {
     return false;
   }
-  *stack_param_size = strtol(tokens[1], &after_number, 16);
+  *stack_param_size = strtol(tokens[next_token++], &after_number, 16);
   if (!IsValidAfterNumber(after_number) ||
       *stack_param_size == std::numeric_limits<long>::max() ||
       *stack_param_size < 0) {
     return false;
   }
-  *name = tokens[2];
+  *name = tokens[next_token++];
 
   return true;
 }
 
 // static
-bool SymbolParseHelper::IsValidAfterNumber(char *after_number) {
+bool SymbolParseHelper::IsValidAfterNumber(char* after_number) {
   if (after_number != NULL && strchr(kWhitespace, *after_number) != NULL) {
     return true;
   }

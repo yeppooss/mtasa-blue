@@ -55,6 +55,7 @@
 #include "common/dwarf_cfi_to_module.h"
 #include "common/dwarf_cu_to_module.h"
 #include "common/dwarf_line_to_module.h"
+#include "common/dwarf_range_list_handler.h"
 #include "common/mac/file_id.h"
 #include "common/mac/arch_utilities.h"
 #include "common/mac/macho_reader.h"
@@ -76,6 +77,7 @@
 using dwarf2reader::ByteReader;
 using google_breakpad::DwarfCUToModule;
 using google_breakpad::DwarfLineToModule;
+using google_breakpad::DwarfRangeListHandler;
 using google_breakpad::FileID;
 using google_breakpad::mach_o::FatReader;
 using google_breakpad::mach_o::Section;
@@ -118,7 +120,7 @@ vector<string> list_directory(const string& directory) {
 
 namespace google_breakpad {
 
-bool DumpSymbols::Read(const string &filename) {
+bool DumpSymbols::Read(const string& filename) {
   struct stat st;
   if (stat(filename.c_str(), &st) == -1) {
     fprintf(stderr, "Could not access object file %s: %s\n",
@@ -193,7 +195,7 @@ bool DumpSymbols::Read(const string &filename) {
 
   // Get our own copy of fat_reader's object file list.
   size_t object_files_count;
-  const SuperFatArch *object_files =
+  const SuperFatArch* object_files =
     fat_reader.object_files(&object_files_count);
   if (object_files_count == 0) {
     fprintf(stderr, "Fat binary file contains *no* architectures: %s\n",
@@ -210,7 +212,7 @@ bool DumpSymbols::Read(const string &filename) {
 bool DumpSymbols::SetArchitecture(cpu_type_t cpu_type,
                                   cpu_subtype_t cpu_subtype) {
   // Find the best match for the architecture the user requested.
-  const SuperFatArch *best_match = FindBestMatchForArchitecture(
+  const SuperFatArch* best_match = FindBestMatchForArchitecture(
       cpu_type, cpu_subtype);
   if (!best_match) return false;
 
@@ -219,9 +221,9 @@ bool DumpSymbols::SetArchitecture(cpu_type_t cpu_type,
   return true;
 }
 
-bool DumpSymbols::SetArchitecture(const std::string &arch_name) {
+bool DumpSymbols::SetArchitecture(const std::string& arch_name) {
   bool arch_set = false;
-  const NXArchInfo *arch_info =
+  const NXArchInfo* arch_info =
       google_breakpad::BreakpadGetArchInfoFromName(arch_name.c_str());
   if (arch_info) {
     arch_set = SetArchitecture(arch_info->cputype, arch_info->cpusubtype);
@@ -249,7 +251,7 @@ SuperFatArch* DumpSymbols::FindBestMatchForArchitecture(
   // If all the object files can be converted to struct fat_arch, use
   // NXFindBestFatArch.
   if (can_convert_to_fat_arch) {
-    const struct fat_arch *best_match
+    const struct fat_arch* best_match
       = NXFindBestFatArch(cpu_type, cpu_subtype, &fat_arch_vector[0],
                           static_cast<uint32_t>(fat_arch_vector.size()));
 
@@ -303,6 +305,29 @@ string DumpSymbols::Identifier() {
   return compacted;
 }
 
+// A range handler that accepts rangelist data parsed by
+// dwarf2reader::RangeListReader and populates a range vector (typically
+// owned by a function) with the results.
+class DumpSymbols::DumperRangesHandler:
+      public DwarfCUToModule::RangesHandler {
+ public:
+  DumperRangesHandler(dwarf2reader::ByteReader* reader) :
+      reader_(reader) { }
+
+  bool ReadRanges(
+      enum dwarf2reader::DwarfForm form, uint64_t data,
+      dwarf2reader::RangeListReader::CURangesInfo* cu_info,
+      vector<Module::Range>* ranges) {
+    DwarfRangeListHandler handler(ranges);
+    dwarf2reader::RangeListReader range_list_reader(reader_, cu_info,
+                                                    &handler);
+    return range_list_reader.ReadRanges(form, data);
+  }
+
+ private:
+  dwarf2reader::ByteReader* reader_;
+};
+
 // A line-to-module loader that accepts line number info parsed by
 // dwarf2reader::LineInfo and populates a Module and a line vector
 // with the results.
@@ -310,22 +335,27 @@ class DumpSymbols::DumperLineToModule:
       public DwarfCUToModule::LineToModuleHandler {
  public:
   // Create a line-to-module converter using BYTE_READER.
-  DumperLineToModule(dwarf2reader::ByteReader *byte_reader)
+  DumperLineToModule(dwarf2reader::ByteReader* byte_reader)
       : byte_reader_(byte_reader) { }
 
   void StartCompilationUnit(const string& compilation_dir) {
     compilation_dir_ = compilation_dir;
   }
 
-  void ReadProgram(const uint8_t *program, uint64 length,
-                   Module *module, vector<Module::Line> *lines) {
+  void ReadProgram(const uint8_t* program, uint64_t length,
+                   const uint8_t* string_section,
+                   uint64_t string_section_length,
+                   const uint8_t* line_string_section,
+                   uint64_t line_string_section_length,
+                   Module* module, vector<Module::Line>* lines) {
     DwarfLineToModule handler(module, compilation_dir_, lines);
-    dwarf2reader::LineInfo parser(program, length, byte_reader_, &handler);
+    dwarf2reader::LineInfo parser(program, length, byte_reader_,
+                                  nullptr, 0, nullptr, 0, &handler);
     parser.Start();
   }
  private:
   string compilation_dir_;
-  dwarf2reader::ByteReader *byte_reader_;  // WEAK
+  dwarf2reader::ByteReader* byte_reader_;  // WEAK
 };
 
 bool DumpSymbols::CreateEmptyModule(scoped_ptr<Module>& module) {
@@ -337,7 +367,7 @@ bool DumpSymbols::CreateEmptyModule(scoped_ptr<Module>& module) {
       selected_object_file_ = &object_files_[0];
     else {
       // Look for an object file whose architecture matches our own.
-      const NXArchInfo *local_arch = NXGetLocalArchInfo();
+      const NXArchInfo* local_arch = NXGetLocalArchInfo();
       if (!SetArchitecture(local_arch->cputype, local_arch->cpusubtype)) {
         fprintf(stderr, "%s: object file contains more than one"
                 " architecture, none of which match the current"
@@ -353,11 +383,11 @@ bool DumpSymbols::CreateEmptyModule(scoped_ptr<Module>& module) {
 
   // Find the name of the selected file's architecture, to appear in
   // the MODULE record and in error messages.
-  const NXArchInfo *selected_arch_info =
+  const NXArchInfo* selected_arch_info =
       google_breakpad::BreakpadGetArchInfoFromCpuType(
           selected_object_file_->cputype, selected_object_file_->cpusubtype);
 
-  const char *selected_arch_name = selected_arch_info->name;
+  const char* selected_arch_name = selected_arch_info->name;
   if (strcmp(selected_arch_name, "i386") == 0)
     selected_arch_name = "x86";
 
@@ -386,9 +416,9 @@ bool DumpSymbols::CreateEmptyModule(scoped_ptr<Module>& module) {
   return true;
 }
 
-bool DumpSymbols::ReadDwarf(google_breakpad::Module *module,
-                            const mach_o::Reader &macho_reader,
-                            const mach_o::SectionMap &dwarf_sections,
+void DumpSymbols::ReadDwarf(google_breakpad::Module* module,
+                            const mach_o::Reader& macho_reader,
+                            const mach_o::SectionMap& dwarf_sections,
                             bool handle_inter_cu_refs) const {
   // Build a byte reader of the appropriate endianness.
   ByteReader byte_reader(macho_reader.big_endian()
@@ -412,27 +442,30 @@ bool DumpSymbols::ReadDwarf(google_breakpad::Module *module,
   // Find the __debug_info section.
   dwarf2reader::SectionMap::const_iterator debug_info_entry =
       file_context.section_map().find("__debug_info");
-  assert(debug_info_entry != file_context.section_map().end());
-  const std::pair<const uint8_t *, uint64>& debug_info_section =
-      debug_info_entry->second;
   // There had better be a __debug_info section!
-  if (!debug_info_section.first) {
+  if (debug_info_entry == file_context.section_map().end()) {
     fprintf(stderr, "%s: __DWARF segment of file has no __debug_info section\n",
             selected_object_name_.c_str());
-    return false;
+    return;
   }
+  const std::pair<const uint8_t*, uint64_t>& debug_info_section =
+      debug_info_entry->second;
 
   // Build a line-to-module loader for the root handler to use.
   DumperLineToModule line_to_module(&byte_reader);
 
+  // .debug_ranges and .debug_rngslists reader
+  DumperRangesHandler ranges_handler(&byte_reader);
+
   // Walk the __debug_info section, one compilation unit at a time.
-  uint64 debug_info_length = debug_info_section.second;
-  for (uint64 offset = 0; offset < debug_info_length;) {
+  uint64_t debug_info_length = debug_info_section.second;
+  for (uint64_t offset = 0; offset < debug_info_length;) {
     // Make a handler for the root DIE that populates MODULE with the
     // debug info.
     DwarfCUToModule::WarningReporter reporter(selected_object_name_,
                                               offset);
-    DwarfCUToModule root_handler(&file_context, &line_to_module, &reporter);
+    DwarfCUToModule root_handler(&file_context, &line_to_module,
+                                 &ranges_handler, &reporter);
     // Make a Dwarf2Handler that drives our DIEHandler.
     dwarf2reader::DIEDispatcher die_dispatcher(&root_handler);
     // Make a DWARF parser for the compilation unit at OFFSET.
@@ -444,13 +477,11 @@ bool DumpSymbols::ReadDwarf(google_breakpad::Module *module,
     // Process the entire compilation unit; get the offset of the next.
     offset += dwarf_reader.Start();
   }
-
-  return true;
 }
 
-bool DumpSymbols::ReadCFI(google_breakpad::Module *module,
-                          const mach_o::Reader &macho_reader,
-                          const mach_o::Section &section,
+bool DumpSymbols::ReadCFI(google_breakpad::Module* module,
+                          const mach_o::Reader& macho_reader,
+                          const mach_o::Section& section,
                           bool eh_frame) const {
   // Find the appropriate set of register names for this file's
   // architecture.
@@ -469,7 +500,7 @@ bool DumpSymbols::ReadCFI(google_breakpad::Module *module,
       register_names = DwarfCFIToModule::RegisterNames::ARM64();
       break;
     default: {
-      const NXArchInfo *arch = google_breakpad::BreakpadGetArchInfoFromCpuType(
+      const NXArchInfo* arch = google_breakpad::BreakpadGetArchInfoFromCpuType(
           macho_reader.cpu_type(), macho_reader.cpu_subtype());
       fprintf(stderr, "%s: cannot convert DWARF call frame information for ",
               selected_object_name_.c_str());
@@ -484,7 +515,7 @@ bool DumpSymbols::ReadCFI(google_breakpad::Module *module,
   }
 
   // Find the call frame information and its size.
-  const uint8_t *cfi = section.contents.start;
+  const uint8_t* cfi = section.contents.start;
   size_t cfi_size = section.contents.Size();
 
   // Plug together the parser, handler, and their entourages.
@@ -516,9 +547,9 @@ class DumpSymbols::LoadCommandDumper:
  public:
   // Create a load command dumper handling load commands from READER's
   // file, and adding data to MODULE.
-  LoadCommandDumper(const DumpSymbols &dumper,
-                    google_breakpad::Module *module,
-                    const mach_o::Reader &reader,
+  LoadCommandDumper(const DumpSymbols& dumper,
+                    google_breakpad::Module* module,
+                    const mach_o::Reader& reader,
                     SymbolData symbol_data,
                     bool handle_inter_cu_refs)
       : dumper_(dumper),
@@ -527,18 +558,18 @@ class DumpSymbols::LoadCommandDumper:
         symbol_data_(symbol_data),
         handle_inter_cu_refs_(handle_inter_cu_refs) { }
 
-  bool SegmentCommand(const mach_o::Segment &segment);
-  bool SymtabCommand(const ByteBuffer &entries, const ByteBuffer &strings);
+  bool SegmentCommand(const mach_o::Segment& segment);
+  bool SymtabCommand(const ByteBuffer& entries, const ByteBuffer& strings);
 
  private:
-  const DumpSymbols &dumper_;
-  google_breakpad::Module *module_;  // WEAK
-  const mach_o::Reader &reader_;
+  const DumpSymbols& dumper_;
+  google_breakpad::Module* module_;  // WEAK
+  const mach_o::Reader& reader_;
   const SymbolData symbol_data_;
   const bool handle_inter_cu_refs_;
 };
 
-bool DumpSymbols::LoadCommandDumper::SegmentCommand(const Segment &segment) {
+bool DumpSymbols::LoadCommandDumper::SegmentCommand(const Segment& segment) {
   mach_o::SectionMap section_map;
   if (!reader_.MapSegmentSections(segment, &section_map))
     return false;
@@ -558,10 +589,7 @@ bool DumpSymbols::LoadCommandDumper::SegmentCommand(const Segment &segment) {
 
   if (segment.name == "__DWARF") {
     if (symbol_data_ != ONLY_CFI) {
-      if (!dumper_.ReadDwarf(module_, reader_, section_map,
-                             handle_inter_cu_refs_)) {
-        return false;
-      }
+      dumper_.ReadDwarf(module_, reader_, section_map, handle_inter_cu_refs_);
     }
     if (symbol_data_ != NO_CFI) {
       mach_o::SectionMap::const_iterator debug_frame
@@ -576,8 +604,8 @@ bool DumpSymbols::LoadCommandDumper::SegmentCommand(const Segment &segment) {
   return true;
 }
 
-bool DumpSymbols::LoadCommandDumper::SymtabCommand(const ByteBuffer &entries,
-                                                   const ByteBuffer &strings) {
+bool DumpSymbols::LoadCommandDumper::SymtabCommand(const ByteBuffer& entries,
+                                                   const ByteBuffer& strings) {
   StabsToModule stabs_to_module(module_);
   // Mac OS X STABS are never "unitized", and the size of the 'value' field
   // matches the address size of the executable.
@@ -619,7 +647,7 @@ bool DumpSymbols::ReadSymbolData(Module** out_module) {
   return true;
 }
 
-bool DumpSymbols::WriteSymbolFile(std::ostream &stream) {
+bool DumpSymbols::WriteSymbolFile(std::ostream& stream) {
   Module* module = NULL;
 
   if (ReadSymbolData(&module) && module) {
@@ -634,7 +662,7 @@ bool DumpSymbols::WriteSymbolFile(std::ostream &stream) {
 // Read the selected object file's debugging information, and write out the
 // header only to |stream|. Return true on success; if an error occurs, report
 // it and return false.
-bool DumpSymbols::WriteSymbolFileHeader(std::ostream &stream) {
+bool DumpSymbols::WriteSymbolFileHeader(std::ostream& stream) {
   scoped_ptr<Module> module;
   if (!CreateEmptyModule(module))
     return false;

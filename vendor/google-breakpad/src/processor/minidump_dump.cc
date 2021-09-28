@@ -91,7 +91,7 @@ static void DumpRawStream(Minidump *minidump,
     // in compatibility warnings.
     uint32_t int_remaining = remaining;
     printf("%.*s", int_remaining, &contents[current_offset]);
-    char *next_null = reinterpret_cast<char *>(
+    char *next_null = reinterpret_cast<char*>(
         memchr(&contents[current_offset], 0, remaining));
     if (next_null == NULL)
       break;
@@ -121,6 +121,9 @@ static bool PrintMinidumpDump(const Options& options) {
     thread_list->Print();
   }
 
+  // It's useful to be able to see the full list of modules here even if it
+  // would cause minidump_stackwalk to fail.
+  MinidumpModuleList::set_max_modules(UINT32_MAX);
   MinidumpModuleList *module_list = minidump.GetModuleList();
   if (!module_list) {
     ++errors;
@@ -238,7 +241,7 @@ static void
 SetupOptions(int argc, char *argv[], Options *options) {
   int ch;
 
-  while ((ch = getopt(argc, (char * const *)argv, "xh")) != -1) {
+  while ((ch = getopt(argc, (char * const*)argv, "xh")) != -1) {
     switch (ch) {
       case 'x':
         options->hexdump = true;

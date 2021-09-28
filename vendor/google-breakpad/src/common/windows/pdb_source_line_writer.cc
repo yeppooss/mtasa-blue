@@ -37,11 +37,15 @@
 #include <ImageHlp.h>
 #include <stdio.h>
 
+#include <algorithm>
 #include <limits>
+#include <map>
 #include <set>
+#include <utility>
 
 #include "common/windows/dia_util.h"
 #include "common/windows/guid_string.h"
+#include "common/windows/pe_util.h"
 #include "common/windows/string_utils-inl.h"
 
 // This constant may be missing from DbgHelp.h.  See the documentation for
@@ -50,77 +54,61 @@
 #define UNDNAME_NO_ECSU 0x8000  // Suppresses enum/class/struct/union.
 #endif  // UNDNAME_NO_ECSU
 
-/*
- * Not defined in WinNT.h for some reason. Definitions taken from:
- * http://uninformed.org/index.cgi?v=4&a=1&p=13
- *
- */
-typedef unsigned char UBYTE;
-
-#if !defined(_WIN64)
-#define UNW_FLAG_EHANDLER  0x01
-#define UNW_FLAG_UHANDLER  0x02
-#define UNW_FLAG_CHAININFO 0x04
-#endif
-
-union UnwindCode {
-  struct {
-    UBYTE offset_in_prolog;
-    UBYTE unwind_operation_code : 4;
-    UBYTE operation_info        : 4;
-  };
-  USHORT frame_offset;
-};
-
-enum UnwindOperationCodes {
-  UWOP_PUSH_NONVOL = 0, /* info == register number */
-  UWOP_ALLOC_LARGE,     /* no info, alloc size in next 2 slots */
-  UWOP_ALLOC_SMALL,     /* info == size of allocation / 8 - 1 */
-  UWOP_SET_FPREG,       /* no info, FP = RSP + UNWIND_INFO.FPRegOffset*16 */
-  UWOP_SAVE_NONVOL,     /* info == register number, offset in next slot */
-  UWOP_SAVE_NONVOL_FAR, /* info == register number, offset in next 2 slots */
-  // XXX: these are missing from MSDN!
-  // See: http://www.osronline.com/ddkx/kmarch/64bitamd_4rs7.htm
-  UWOP_SAVE_XMM,
-  UWOP_SAVE_XMM_FAR,
-  UWOP_SAVE_XMM128,     /* info == XMM reg number, offset in next slot */
-  UWOP_SAVE_XMM128_FAR, /* info == XMM reg number, offset in next 2 slots */
-  UWOP_PUSH_MACHFRAME   /* info == 0: no error-code, 1: error-code */
-};
-
-// See: http://msdn.microsoft.com/en-us/library/ddssxxy8.aspx
-// Note: some fields removed as we don't use them.
-struct UnwindInfo {
-  UBYTE version       : 3;
-  UBYTE flags         : 5;
-  UBYTE size_of_prolog;
-  UBYTE count_of_codes;
-  UBYTE frame_register : 4;
-  UBYTE frame_offset   : 4;
-  UnwindCode unwind_code[1];
-};
-
 namespace google_breakpad {
 
 namespace {
 
 using std::vector;
 
-// A helper class to scope a PLOADED_IMAGE.
-class AutoImage {
- public:
-  explicit AutoImage(PLOADED_IMAGE img) : img_(img) {}
-  ~AutoImage() {
-    if (img_)
-      ImageUnload(img_);
+// The symbol (among possibly many) selected to represent an rva.
+struct SelectedSymbol {
+  SelectedSymbol(const CComPtr<IDiaSymbol>& symbol, bool is_public)
+      : symbol(symbol), is_public(is_public), is_multiple(false) {}
+
+  // The symbol to use for an rva.
+  CComPtr<IDiaSymbol> symbol;
+  // Whether this is a public or function symbol.
+  bool is_public;
+  // Whether the rva has multiple associated symbols. An rva will correspond to
+  // multiple symbols in the case of linker identical symbol folding.
+  bool is_multiple;
+};
+
+// Maps rva to the symbol to use for that address.
+typedef std::map<DWORD, SelectedSymbol> SymbolMap;
+
+// Record this in the map as the selected symbol for the rva if it satisfies the
+// necessary conditions.
+void MaybeRecordSymbol(DWORD rva,
+                       const CComPtr<IDiaSymbol> symbol,
+                       bool is_public,
+                       SymbolMap* map) {
+  SymbolMap::iterator loc = map->find(rva);
+  if (loc == map->end()) {
+    map->insert(std::make_pair(rva, SelectedSymbol(symbol, is_public)));
+    return;
   }
 
-  operator PLOADED_IMAGE() { return img_; }
-  PLOADED_IMAGE operator->() { return img_; }
+  // Prefer function symbols to public symbols.
+  if (is_public && !loc->second.is_public) {
+    return;
+  }
 
- private:
-  PLOADED_IMAGE img_;
-};
+  loc->second.is_multiple = true;
+
+  // Take the 'least' symbol by lexicographical order of the decorated name. We
+  // use the decorated rather than undecorated name because computing the latter
+  // is expensive.
+  BSTR current_name, new_name;
+  loc->second.symbol->get_name(&current_name);
+  symbol->get_name(&new_name);
+  if (wcscmp(new_name, current_name) < 0) {
+    loc->second.symbol = symbol;
+    loc->second.is_public = is_public;
+  }
+}
+
+
 
 bool SymbolsMatch(IDiaSymbol* a, IDiaSymbol* b) {
   DWORD a_section, a_offset, b_section, b_offset;
@@ -132,7 +120,7 @@ bool SymbolsMatch(IDiaSymbol* a, IDiaSymbol* b) {
   return a_section == b_section && a_offset == b_offset;
 }
 
-bool CreateDiaDataSourceInstance(CComPtr<IDiaDataSource> &data_source) {
+bool CreateDiaDataSourceInstance(CComPtr<IDiaDataSource>& data_source) {
   if (SUCCEEDED(data_source.CoCreateInstance(CLSID_DiaSource))) {
     return true;
   }
@@ -146,7 +134,7 @@ bool CreateDiaDataSourceInstance(CComPtr<IDiaDataSource> &data_source) {
   // We can try loading the DLL corresponding to the #included DIA SDK, but
   // the DIA headers don't provide a version. Lets try to figure out which DIA
   // version we're compiling against by comparing CLSIDs.
-  const wchar_t *msdia_dll = nullptr;
+  const wchar_t* msdia_dll = nullptr;
   if (CLSID_DiaSource == _uuidof(DiaSource100)) {
     msdia_dll = L"msdia100.dll";
   } else if (CLSID_DiaSource == _uuidof(DiaSource110)) {
@@ -159,11 +147,63 @@ bool CreateDiaDataSourceInstance(CComPtr<IDiaDataSource> &data_source) {
 
   if (msdia_dll &&
       SUCCEEDED(NoRegCoCreate(msdia_dll, CLSID_DiaSource, IID_IDiaDataSource,
-                              reinterpret_cast<void **>(&data_source)))) {
+                              reinterpret_cast<void**>(&data_source)))) {
     return true;
   }
 
   return false;
+}
+
+const DWORD kUndecorateOptions = UNDNAME_NO_MS_KEYWORDS |
+                                 UNDNAME_NO_FUNCTION_RETURNS |
+                                 UNDNAME_NO_ALLOCATION_MODEL |
+                                 UNDNAME_NO_ALLOCATION_LANGUAGE |
+                                 UNDNAME_NO_THISTYPE |
+                                 UNDNAME_NO_ACCESS_SPECIFIERS |
+                                 UNDNAME_NO_THROW_SIGNATURES |
+                                 UNDNAME_NO_MEMBER_TYPE |
+                                 UNDNAME_NO_RETURN_UDT_MODEL |
+                                 UNDNAME_NO_ECSU;
+
+#define arraysize(f) (sizeof(f) / sizeof(*f))
+
+void StripLlvmSuffixAndUndecorate(BSTR* name) {
+  // LLVM sometimes puts a suffix on symbols to give them a globally unique
+  // name. The suffix is either some string preceded by a period (like in the
+  // Itanium ABI; also on Windows this is safe since periods are otherwise
+  // never part of mangled names), or a dollar sign followed by a 32-char hex
+  // string (this should go away in future LLVM versions). Strip such suffixes
+  // and try demangling again.
+  //
+  //
+  // Example symbol names with such suffixes:
+  //
+  //   ?foo@@YAXXZ$5520c83448162c04f2b239db4b5a2c61
+  //   ?foo@@YAXXZ.llvm.13040715209719948753
+
+  if (**name != L'?')
+    return;  // The name is already demangled.
+
+  for (size_t i = 0, len = wcslen(*name); i < len; i++) {
+    wchar_t c = (*name)[i];
+
+    if (c == L'.' || (c == L'$' && len - i == 32 + 1)) {
+      (*name)[i] = L'\0';
+      wchar_t undecorated[1024];
+      DWORD res = UnDecorateSymbolNameW(*name, undecorated,
+                                        arraysize(undecorated),
+                                        kUndecorateOptions);
+      if (res == 0 || undecorated[0] == L'?') {
+        // Demangling failed; restore the symbol name and return.
+        (*name)[i] = c;
+        return;
+      }
+
+      SysFreeString(*name);
+      *name = SysAllocString(undecorated);
+      return;
+    }
+  }
 }
 
 }  // namespace
@@ -172,9 +212,10 @@ PDBSourceLineWriter::PDBSourceLineWriter() : output_(NULL) {
 }
 
 PDBSourceLineWriter::~PDBSourceLineWriter() {
+  Close();
 }
 
-bool PDBSourceLineWriter::SetCodeFile(const wstring &exe_file) {
+bool PDBSourceLineWriter::SetCodeFile(const wstring& exe_file) {
   if (code_file_.empty()) {
     code_file_ = exe_file;
     return true;
@@ -184,7 +225,7 @@ bool PDBSourceLineWriter::SetCodeFile(const wstring &exe_file) {
   return exe_file == code_file_;
 }
 
-bool PDBSourceLineWriter::Open(const wstring &file, FileFormat format) {
+bool PDBSourceLineWriter::Open(const wstring& file, FileFormat format) {
   Close();
   code_file_.clear();
 
@@ -239,7 +280,7 @@ bool PDBSourceLineWriter::Open(const wstring &file, FileFormat format) {
   return true;
 }
 
-bool PDBSourceLineWriter::PrintLines(IDiaEnumLineNumbers *lines) {
+bool PDBSourceLineWriter::PrintLines(IDiaEnumLineNumbers* lines) {
   // The line number format is:
   // <rva> <line number> <source file id>
   CComPtr<IDiaLineNumber> line;
@@ -283,8 +324,9 @@ bool PDBSourceLineWriter::PrintLines(IDiaEnumLineNumbers *lines) {
   return true;
 }
 
-bool PDBSourceLineWriter::PrintFunction(IDiaSymbol *function,
-                                        IDiaSymbol *block) {
+bool PDBSourceLineWriter::PrintFunction(IDiaSymbol* function,
+                                        IDiaSymbol* block,
+                                        bool has_multiple_symbols) {
   // The function format is:
   // FUNC <address> <length> <param_stack_size> <function>
   DWORD rva;
@@ -320,9 +362,9 @@ bool PDBSourceLineWriter::PrintFunction(IDiaSymbol *function,
   MapAddressRange(image_map_, AddressRange(rva, static_cast<DWORD>(length)),
                   &ranges);
   for (size_t i = 0; i < ranges.size(); ++i) {
-    fprintf(output_, "FUNC %lx %lx %x %ws\n",
-            ranges[i].rva, ranges[i].length, stack_param_size,
-            name.m_str);
+    const char* optional_multiple_field = has_multiple_symbols ? "m " : "";
+    fprintf(output_, "FUNC %s%lx %lx %x %ws\n", optional_multiple_field,
+            ranges[i].rva, ranges[i].length, stack_param_size, name.m_str);
   }
 
   CComPtr<IDiaEnumLineNumbers> lines;
@@ -400,7 +442,7 @@ bool PDBSourceLineWriter::PrintFunctions() {
   CComPtr<IDiaEnumSymbols> symbols = NULL;
 
   // Find all function symbols first.
-  std::set<DWORD> rvas;
+  SymbolMap rva_symbol;
   hr = global->findChildren(SymTagFunction, NULL, nsNone, &symbols);
 
   if (SUCCEEDED(hr)) {
@@ -408,9 +450,8 @@ bool PDBSourceLineWriter::PrintFunctions() {
 
     while (SUCCEEDED(symbols->Next(1, &symbol, &count)) && count == 1) {
       if (SUCCEEDED(symbol->get_relativeVirtualAddress(&rva))) {
-        // To maintain existing behavior of one symbol per address, place the
-        // rva onto a set here to uniquify them.
-        rvas.insert(rva);
+        // Potentially record this as the canonical symbol for this rva.
+        MaybeRecordSymbol(rva, symbol, false, &rva_symbol);
       } else {
         fprintf(stderr, "get_relativeVirtualAddress failed on the symbol\n");
         return false;
@@ -422,9 +463,8 @@ bool PDBSourceLineWriter::PrintFunctions() {
     symbols.Release();
   }
 
-  // Find all public symbols.  Store public symbols that are not also private
-  // symbols for later.
-  std::set<DWORD> public_only_rvas;
+  // Find all public symbols and record public symbols that are not also private
+  // symbols.
   hr = global->findChildren(SymTagPublicSymbol, NULL, nsNone, &symbols);
 
   if (SUCCEEDED(hr)) {
@@ -432,10 +472,8 @@ bool PDBSourceLineWriter::PrintFunctions() {
 
     while (SUCCEEDED(symbols->Next(1, &symbol, &count)) && count == 1) {
       if (SUCCEEDED(symbol->get_relativeVirtualAddress(&rva))) {
-        if (rvas.count(rva) == 0) {
-          rvas.insert(rva); // Keep symbols in rva order.
-          public_only_rvas.insert(rva);
-        }
+        // Potentially record this as the canonical symbol for this rva.
+        MaybeRecordSymbol(rva, symbol, true, &rva_symbol);
       } else {
         fprintf(stderr, "get_relativeVirtualAddress failed on the symbol\n");
         return false;
@@ -447,39 +485,17 @@ bool PDBSourceLineWriter::PrintFunctions() {
     symbols.Release();
   }
 
-  std::set<DWORD>::iterator it;
-
-  // For each rva, dump the first symbol DIA knows about at the address.
-  for (it = rvas.begin(); it != rvas.end(); ++it) {
-    CComPtr<IDiaSymbol> symbol = NULL;
-    // If the symbol is not in the public list, look for SymTagFunction. This is
-    // a workaround to a bug where DIA will hang if searching for a private
-    // symbol at an address where only a public symbol exists.
-    // See http://connect.microsoft.com/VisualStudio/feedback/details/722366
-    if (public_only_rvas.count(*it) == 0) {
-      if (SUCCEEDED(session_->findSymbolByRVA(*it, SymTagFunction, &symbol))) {
-        // Sometimes findSymbolByRVA returns S_OK, but NULL.
-        if (symbol) {
-          if (!PrintFunction(symbol, symbol))
-            return false;
-          symbol.Release();
-        }
-      } else {
-        fprintf(stderr, "findSymbolByRVA SymTagFunction failed\n");
+  // For each rva, dump the selected symbol at the address.
+  SymbolMap::iterator it;
+  for (it = rva_symbol.begin(); it != rva_symbol.end(); ++it) {
+    CComPtr<IDiaSymbol> symbol = it->second.symbol;
+    // Only print public symbols if there is no function symbol for the address.
+    if (!it->second.is_public) {
+      if (!PrintFunction(symbol, symbol, it->second.is_multiple))
         return false;
-      }
-    } else if (SUCCEEDED(session_->findSymbolByRVA(*it,
-                                                   SymTagPublicSymbol,
-                                                   &symbol))) {
-      // Sometimes findSymbolByRVA returns S_OK, but NULL.
-      if (symbol) {
-        if (!PrintCodePublicSymbol(symbol))
-          return false;
-        symbol.Release();
-      }
     } else {
-      fprintf(stderr, "findSymbolByRVA SymTagPublicSymbol failed\n");
-      return false;
+      if (!PrintCodePublicSymbol(symbol, it->second.is_multiple))
+        return false;
     }
   }
 
@@ -522,7 +538,7 @@ bool PDBSourceLineWriter::PrintFunctions() {
             SUCCEEDED(parent->get_relativeVirtualAddress(&func_rva)) &&
             SUCCEEDED(parent->get_length(&func_length))) {
           if (block_rva < func_rva || block_rva > (func_rva + func_length)) {
-            if (!PrintFunction(parent, block)) {
+            if (!PrintFunction(parent, block, false)) {
               return false;
             }
           }
@@ -702,131 +718,7 @@ bool PDBSourceLineWriter::PrintFrameDataUsingEXE() {
     return false;
   }
 
-  // Convert wchar to native charset because ImageLoad only takes
-  // a PSTR as input.
-  string code_file;
-  if (!WindowsStringUtils::safe_wcstombs(code_file_, &code_file)) {
-    return false;
-  }
-
-  AutoImage img(ImageLoad((PSTR)code_file.c_str(), NULL));
-  if (!img) {
-    fprintf(stderr, "Failed to load %s\n", code_file.c_str());
-    return false;
-  }
-  PIMAGE_OPTIONAL_HEADER64 optional_header =
-    &(reinterpret_cast<PIMAGE_NT_HEADERS64>(img->FileHeader))->OptionalHeader;
-  if (optional_header->Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-    fprintf(stderr, "Not a PE32+ image\n");
-    return false;
-  }
-
-  // Read Exception Directory
-  DWORD exception_rva = optional_header->
-    DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress;
-  DWORD exception_size = optional_header->
-    DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size;
-  PIMAGE_RUNTIME_FUNCTION_ENTRY funcs =
-    static_cast<PIMAGE_RUNTIME_FUNCTION_ENTRY>(
-        ImageRvaToVa(img->FileHeader,
-                     img->MappedAddress,
-                     exception_rva,
-                     &img->LastRvaSection));
-  for (DWORD i = 0; i < exception_size / sizeof(*funcs); i++) {
-    DWORD unwind_rva = funcs[i].UnwindInfoAddress;
-    // handle chaining
-    while (unwind_rva & 0x1) {
-      unwind_rva ^= 0x1;
-      PIMAGE_RUNTIME_FUNCTION_ENTRY chained_func =
-        static_cast<PIMAGE_RUNTIME_FUNCTION_ENTRY>(
-            ImageRvaToVa(img->FileHeader,
-                         img->MappedAddress,
-                         unwind_rva,
-                         &img->LastRvaSection));
-      unwind_rva = chained_func->UnwindInfoAddress;
-    }
-
-    UnwindInfo *unwind_info = static_cast<UnwindInfo *>(
-        ImageRvaToVa(img->FileHeader,
-                     img->MappedAddress,
-                     unwind_rva,
-                     &img->LastRvaSection));
-
-    DWORD stack_size = 8;  // minimal stack size is 8 for RIP
-    DWORD rip_offset = 8;
-    do {
-      for (UBYTE c = 0; c < unwind_info->count_of_codes; c++) {
-        UnwindCode *unwind_code = &unwind_info->unwind_code[c];
-        switch (unwind_code->unwind_operation_code) {
-          case UWOP_PUSH_NONVOL: {
-            stack_size += 8;
-            break;
-          }
-          case UWOP_ALLOC_LARGE: {
-            if (unwind_code->operation_info == 0) {
-              c++;
-              if (c < unwind_info->count_of_codes)
-                stack_size += (unwind_code + 1)->frame_offset * 8;
-            } else {
-              c += 2;
-              if (c < unwind_info->count_of_codes)
-                stack_size += (unwind_code + 1)->frame_offset |
-                              ((unwind_code + 2)->frame_offset << 16);
-            }
-            break;
-          }
-          case UWOP_ALLOC_SMALL: {
-            stack_size += unwind_code->operation_info * 8 + 8;
-            break;
-          }
-          case UWOP_SET_FPREG:
-          case UWOP_SAVE_XMM:
-          case UWOP_SAVE_XMM_FAR:
-            break;
-          case UWOP_SAVE_NONVOL:
-          case UWOP_SAVE_XMM128: {
-            c++;  // skip slot with offset
-            break;
-          }
-          case UWOP_SAVE_NONVOL_FAR:
-          case UWOP_SAVE_XMM128_FAR: {
-            c += 2;  // skip 2 slots with offset
-            break;
-          }
-          case UWOP_PUSH_MACHFRAME: {
-            if (unwind_code->operation_info) {
-              stack_size += 88;
-            } else {
-              stack_size += 80;
-            }
-            rip_offset += 80;
-            break;
-          }
-        }
-      }
-      if (unwind_info->flags & UNW_FLAG_CHAININFO) {
-        PIMAGE_RUNTIME_FUNCTION_ENTRY chained_func =
-          reinterpret_cast<PIMAGE_RUNTIME_FUNCTION_ENTRY>(
-              (unwind_info->unwind_code +
-              ((unwind_info->count_of_codes + 1) & ~1)));
-
-        unwind_info = static_cast<UnwindInfo *>(
-            ImageRvaToVa(img->FileHeader,
-                         img->MappedAddress,
-                         chained_func->UnwindInfoAddress,
-                         &img->LastRvaSection));
-      } else {
-        unwind_info = NULL;
-      }
-    } while (unwind_info);
-    fprintf(output_, "STACK CFI INIT %lx %lx .cfa: $rsp .ra: .cfa %lu - ^\n",
-            funcs[i].BeginAddress,
-            funcs[i].EndAddress - funcs[i].BeginAddress, rip_offset);
-    fprintf(output_, "STACK CFI %lx .cfa: $rsp %lu +\n",
-            funcs[i].BeginAddress, stack_size);
-  }
-
-  return true;
+  return PrintPEFrameData(code_file_, output_);
 }
 
 bool PDBSourceLineWriter::PrintFrameData() {
@@ -839,7 +731,8 @@ bool PDBSourceLineWriter::PrintFrameData() {
   return false;
 }
 
-bool PDBSourceLineWriter::PrintCodePublicSymbol(IDiaSymbol *symbol) {
+bool PDBSourceLineWriter::PrintCodePublicSymbol(IDiaSymbol* symbol,
+                                                bool has_multiple_symbols) {
   BOOL is_code;
   if (FAILED(symbol->get_code(&is_code))) {
     return false;
@@ -862,8 +755,9 @@ bool PDBSourceLineWriter::PrintCodePublicSymbol(IDiaSymbol *symbol) {
   AddressRangeVector ranges;
   MapAddressRange(image_map_, AddressRange(rva, 1), &ranges);
   for (size_t i = 0; i < ranges.size(); ++i) {
-    fprintf(output_, "PUBLIC %lx %x %ws\n", ranges[i].rva,
-            stack_param_size > 0 ? stack_param_size : 0,
+    const char* optional_multiple_field = has_multiple_symbols ? "m " : "";
+    fprintf(output_, "PUBLIC %s%lx %x %ws\n", optional_multiple_field,
+            ranges[i].rva, stack_param_size > 0 ? stack_param_size : 0,
             name.m_str);
   }
 
@@ -939,9 +833,9 @@ bool PDBSourceLineWriter::PrintPEInfo() {
 // and scanf families, which are not as strict about input and in some cases
 // don't provide a good way for the caller to determine if a conversion was
 // successful.
-static bool wcstol_positive_strict(wchar_t *string, int *result) {
+static bool wcstol_positive_strict(wchar_t* string, int* result) {
   int value = 0;
-  for (wchar_t *c = string; *c != '\0'; ++c) {
+  for (wchar_t* c = string; *c != '\0'; ++c) {
     int last_value = value;
     value *= 10;
     // Detect overflow.
@@ -979,7 +873,7 @@ bool PDBSourceLineWriter::FindPEFile() {
     wstring file(symbols_file);
 
     // Look for an EXE or DLL file.
-    const wchar_t *extensions[] = { L"exe", L"dll" };
+    const wchar_t* extensions[] = { L"exe", L"dll" };
     for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
       size_t dot_pos = file.find_last_of(L".");
       if (dot_pos != wstring::npos) {
@@ -997,23 +891,13 @@ bool PDBSourceLineWriter::FindPEFile() {
 }
 
 // static
-bool PDBSourceLineWriter::GetSymbolFunctionName(IDiaSymbol *function,
-                                                BSTR *name,
-                                                int *stack_param_size) {
+bool PDBSourceLineWriter::GetSymbolFunctionName(IDiaSymbol* function,
+                                                BSTR* name,
+                                                int* stack_param_size) {
   *stack_param_size = -1;
-  const DWORD undecorate_options = UNDNAME_NO_MS_KEYWORDS |
-                                   UNDNAME_NO_FUNCTION_RETURNS |
-                                   UNDNAME_NO_ALLOCATION_MODEL |
-                                   UNDNAME_NO_ALLOCATION_LANGUAGE |
-                                   UNDNAME_NO_THISTYPE |
-                                   UNDNAME_NO_ACCESS_SPECIFIERS |
-                                   UNDNAME_NO_THROW_SIGNATURES |
-                                   UNDNAME_NO_MEMBER_TYPE |
-                                   UNDNAME_NO_RETURN_UDT_MODEL |
-                                   UNDNAME_NO_ECSU;
 
   // Use get_undecoratedNameEx to get readable C++ names with arguments.
-  if (function->get_undecoratedNameEx(undecorate_options, name) != S_OK) {
+  if (function->get_undecoratedNameEx(kUndecorateOptions, name) != S_OK) {
     if (function->get_name(name) != S_OK) {
       fprintf(stderr, "failed to get function name\n");
       return false;
@@ -1037,15 +921,17 @@ bool PDBSourceLineWriter::GetSymbolFunctionName(IDiaSymbol *function,
     // all of the parameter and return type information may not be included in
     // the name string.
   } else {
+    StripLlvmSuffixAndUndecorate(name);
+
     // C++ uses a bogus "void" argument for functions and methods that don't
     // take any parameters.  Take it out of the undecorated name because it's
     // ugly and unnecessary.
-    const wchar_t *replace_string = L"(void)";
+    const wchar_t* replace_string = L"(void)";
     const size_t replace_length = wcslen(replace_string);
-    const wchar_t *replacement_string = L"()";
+    const wchar_t* replacement_string = L"()";
     size_t length = wcslen(*name);
     if (length >= replace_length) {
-      wchar_t *name_end = *name + length - replace_length;
+      wchar_t* name_end = *name + length - replace_length;
       if (wcscmp(name_end, replace_string) == 0) {
         WindowsStringUtils::safe_wcscpy(name_end, replace_length,
                                         replacement_string);
@@ -1061,7 +947,7 @@ bool PDBSourceLineWriter::GetSymbolFunctionName(IDiaSymbol *function,
     // whether the undecorated name contains any ':' or '(' characters.
     if (!wcschr(*name, ':') && !wcschr(*name, '(') &&
         (*name[0] == '_' || *name[0] == '@')) {
-      wchar_t *last_at = wcsrchr(*name + 1, '@');
+      wchar_t* last_at = wcsrchr(*name + 1, '@');
       if (last_at && wcstol_positive_strict(last_at + 1, stack_param_size)) {
         // If this function adheres to the fastcall convention, it accepts up
         // to the first 8 bytes of parameters in registers (%ecx and %edx).
@@ -1093,7 +979,7 @@ bool PDBSourceLineWriter::GetSymbolFunctionName(IDiaSymbol *function,
 }
 
 // static
-int PDBSourceLineWriter::GetFunctionStackParamSize(IDiaSymbol *function) {
+int PDBSourceLineWriter::GetFunctionStackParamSize(IDiaSymbol* function) {
   // This implementation is highly x86-specific.
 
   // Gather the symbols corresponding to data.
@@ -1208,8 +1094,8 @@ next_child:
   return param_size;
 }
 
-bool PDBSourceLineWriter::WriteMap(FILE *map_file) {
-  output_ = map_file;
+bool PDBSourceLineWriter::WriteSymbols(FILE* symbol_file) {
+  output_ = symbol_file;
 
   // Load the OMAP information, and disable auto-translation of addresses in
   // preference of doing it ourselves.
@@ -1231,10 +1117,12 @@ bool PDBSourceLineWriter::WriteMap(FILE *map_file) {
 }
 
 void PDBSourceLineWriter::Close() {
-  session_.Release();
+  if (session_ != nullptr) {
+    session_.Release();
+  }
 }
 
-bool PDBSourceLineWriter::GetModuleInfo(PDBModuleInfo *info) {
+bool PDBSourceLineWriter::GetModuleInfo(PDBModuleInfo* info) {
   if (!info) {
     return false;
   }
@@ -1256,17 +1144,7 @@ bool PDBSourceLineWriter::GetModuleInfo(PDBModuleInfo *info) {
     // Instead, it returns one of the IMAGE_FILE_MACHINE values as
     // defined here:
     // http://msdn.microsoft.com/en-us/library/ms680313%28VS.85%29.aspx
-    switch (machine_type) {
-      case IMAGE_FILE_MACHINE_I386:
-        info->cpu = L"x86";
-        break;
-      case IMAGE_FILE_MACHINE_AMD64:
-        info->cpu = L"x86_64";
-        break;
-      default:
-        info->cpu = L"unknown";
-        break;
-    }
+    info->cpu = FileHeaderMachineToCpuString(static_cast<WORD>(machine_type));
   } else {
     // Unexpected, but handle gracefully.
     info->cpu = L"unknown";
@@ -1289,35 +1167,14 @@ bool PDBSourceLineWriter::GetModuleInfo(PDBModuleInfo *info) {
       return false;
     }
 
-    // Use the same format that the MS symbol server uses in filesystem
-    // hierarchies.
-    wchar_t age_string[9];
-    swprintf(age_string, sizeof(age_string) / sizeof(age_string[0]),
-             L"%x", age);
-
-    // remove when VC++7.1 is no longer supported
-    age_string[sizeof(age_string) / sizeof(age_string[0]) - 1] = L'\0';
-
-    info->debug_identifier = GUIDString::GUIDToSymbolServerWString(&guid);
-    info->debug_identifier.append(age_string);
+    info->debug_identifier = GenerateDebugIdentifier(age, guid);
   } else {
     DWORD signature;
     if (FAILED(global->get_signature(&signature))) {
       return false;
     }
 
-    // Use the same format that the MS symbol server uses in filesystem
-    // hierarchies.
-    wchar_t identifier_string[17];
-    swprintf(identifier_string,
-             sizeof(identifier_string) / sizeof(identifier_string[0]),
-             L"%08X%x", signature, age);
-
-    // remove when VC++7.1 is no longer supported
-    identifier_string[sizeof(identifier_string) /
-                      sizeof(identifier_string[0]) - 1] = L'\0';
-
-    info->debug_identifier = identifier_string;
+    info->debug_identifier = GenerateDebugIdentifier(age, signature);
   }
 
   CComBSTR debug_file_string;
@@ -1330,7 +1187,7 @@ bool PDBSourceLineWriter::GetModuleInfo(PDBModuleInfo *info) {
   return true;
 }
 
-bool PDBSourceLineWriter::GetPEInfo(PEModuleInfo *info) {
+bool PDBSourceLineWriter::GetPEInfo(PEModuleInfo* info) {
   if (!info) {
     return false;
   }
@@ -1340,44 +1197,10 @@ bool PDBSourceLineWriter::GetPEInfo(PEModuleInfo *info) {
     return false;
   }
 
-  // Convert wchar to native charset because ImageLoad only takes
-  // a PSTR as input.
-  string code_file;
-  if (!WindowsStringUtils::safe_wcstombs(code_file_, &code_file)) {
-    return false;
-  }
-
-  AutoImage img(ImageLoad((PSTR)code_file.c_str(), NULL));
-  if (!img) {
-    fprintf(stderr, "Failed to open PE file: %s\n", code_file.c_str());
-    return false;
-  }
-
-  info->code_file = WindowsStringUtils::GetBaseName(code_file_);
-
-  // The date and time that the file was created by the linker.
-  DWORD TimeDateStamp = img->FileHeader->FileHeader.TimeDateStamp;
-  // The size of the file in bytes, including all headers.
-  DWORD SizeOfImage = 0;
-  PIMAGE_OPTIONAL_HEADER64 opt =
-    &((PIMAGE_NT_HEADERS64)img->FileHeader)->OptionalHeader;
-  if (opt->Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-    // 64-bit PE file.
-    SizeOfImage = opt->SizeOfImage;
-  } else {
-    // 32-bit PE file.
-    SizeOfImage = img->FileHeader->OptionalHeader.SizeOfImage;
-  }
-  wchar_t code_identifier[32];
-  swprintf(code_identifier,
-      sizeof(code_identifier) / sizeof(code_identifier[0]),
-      L"%08X%X", TimeDateStamp, SizeOfImage);
-  info->code_identifier = code_identifier;
-
-  return true;
+  return ReadPEInfo(code_file_, info);
 }
 
-bool PDBSourceLineWriter::UsesGUID(bool *uses_guid) {
+bool PDBSourceLineWriter::UsesGUID(bool* uses_guid) {
   if (!uses_guid)
     return false;
 

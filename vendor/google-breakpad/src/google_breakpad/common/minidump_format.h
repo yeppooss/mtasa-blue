@@ -529,7 +529,7 @@ static const size_t MDRawMemoryList_minsize = offsetof(MDRawMemoryList,
                                                        memory_ranges[0]);
 
 
-#define MD_EXCEPTION_MAXIMUM_PARAMETERS 15
+#define MD_EXCEPTION_MAXIMUM_PARAMETERS 15u
 
 typedef struct {
   uint32_t  exception_code;     /* Windows: MDExceptionCodeWin,
@@ -549,6 +549,7 @@ typedef struct {
   uint64_t  exception_information[MD_EXCEPTION_MAXIMUM_PARAMETERS];
 } MDException;  /* MINIDUMP_EXCEPTION */
 
+#include "minidump_exception_fuchsia.h"
 #include "minidump_exception_linux.h"
 #include "minidump_exception_mac.h"
 #include "minidump_exception_ps3.h"
@@ -654,9 +655,10 @@ typedef enum {
   MD_CPU_ARCHITECTURE_AMD64     =  9,  /* PROCESSOR_ARCHITECTURE_AMD64 */
   MD_CPU_ARCHITECTURE_X86_WIN64 = 10,
       /* PROCESSOR_ARCHITECTURE_IA32_ON_WIN64 (WoW64) */
+  MD_CPU_ARCHITECTURE_ARM64     = 12,  /* PROCESSOR_ARCHITECTURE_ARM64 */
   MD_CPU_ARCHITECTURE_SPARC     = 0x8001, /* Breakpad-defined value for SPARC */
   MD_CPU_ARCHITECTURE_PPC64     = 0x8002, /* Breakpad-defined value for PPC64 */
-  MD_CPU_ARCHITECTURE_ARM64     = 0x8003, /* Breakpad-defined value for ARM64 */
+  MD_CPU_ARCHITECTURE_ARM64_OLD = 0x8003, /* Breakpad-defined value for ARM64 */
   MD_CPU_ARCHITECTURE_MIPS64    = 0x8004, /* Breakpad-defined value for MIPS64 */
   MD_CPU_ARCHITECTURE_UNKNOWN   = 0xffff  /* PROCESSOR_ARCHITECTURE_UNKNOWN */
 } MDCPUArchitecture;
@@ -677,7 +679,8 @@ typedef enum {
   MD_OS_SOLARIS       = 0x8202,  /* Solaris */
   MD_OS_ANDROID       = 0x8203,  /* Android */
   MD_OS_PS3           = 0x8204,  /* PS3 */
-  MD_OS_NACL          = 0x8205   /* Native Client (NaCl) */
+  MD_OS_NACL          = 0x8205,  /* Native Client (NaCl) */
+  MD_OS_FUCHSIA       = 0x8206   /* Fuchsia */
 } MDOSPlatform;
 
 typedef struct {

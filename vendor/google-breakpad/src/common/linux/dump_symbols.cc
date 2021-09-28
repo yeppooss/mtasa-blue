@@ -38,6 +38,7 @@
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <link.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -58,6 +59,7 @@
 #include "common/dwarf_cfi_to_module.h"
 #include "common/dwarf_cu_to_module.h"
 #include "common/dwarf_line_to_module.h"
+#include "common/dwarf_range_list_handler.h"
 #include "common/linux/crc32.h"
 #include "common/linux/eintr_wrapper.h"
 #include "common/linux/elfutils.h"
@@ -81,6 +83,7 @@ using google_breakpad::DumpOptions;
 using google_breakpad::DwarfCFIToModule;
 using google_breakpad::DwarfCUToModule;
 using google_breakpad::DwarfLineToModule;
+using google_breakpad::DwarfRangeListHandler;
 using google_breakpad::ElfClass;
 using google_breakpad::ElfClass32;
 using google_breakpad::ElfClass64;
@@ -141,7 +144,7 @@ class MmapWrapper {
       munmap(base_, size_);
     }
   }
-  void set(void *mapped_address, size_t mapped_size) {
+  void set(void* mapped_address, size_t mapped_size) {
     is_set_ = true;
     base_ = mapped_address;
     size_ = mapped_size;
@@ -179,6 +182,23 @@ typename ElfClass::Addr GetLoadingAddress(
   return 0;
 }
 
+// Find the set of address ranges for all PT_LOAD segments.
+template <typename ElfClass>
+vector<Module::Range> GetPtLoadSegmentRanges(
+    const typename ElfClass::Phdr* program_headers,
+    int nheader) {
+  typedef typename ElfClass::Phdr Phdr;
+  vector<Module::Range> ranges;
+
+  for (int i = 0; i < nheader; ++i) {
+    const Phdr& header = program_headers[i];
+    if (header.p_type == PT_LOAD) {
+      ranges.push_back(Module::Range(header.p_vaddr, header.p_memsz));
+    }
+  }
+  return ranges;
+}
+
 #ifndef NO_STABS_SUPPORT
 template<typename ElfClass>
 bool LoadStabs(const typename ElfClass::Ehdr* elf_header,
@@ -207,26 +227,56 @@ bool LoadStabs(const typename ElfClass::Ehdr* elf_header,
 }
 #endif  // NO_STABS_SUPPORT
 
+// A range handler that accepts rangelist data parsed by
+// dwarf2reader::RangeListReader and populates a range vector (typically
+// owned by a function) with the results.
+class DumperRangesHandler : public DwarfCUToModule::RangesHandler {
+ public:
+  DumperRangesHandler(dwarf2reader::ByteReader* reader) :
+      reader_(reader) { }
+
+  bool ReadRanges(
+      enum dwarf2reader::DwarfForm form, uint64_t data,
+      dwarf2reader::RangeListReader::CURangesInfo* cu_info,
+      vector<Module::Range>* ranges) {
+    DwarfRangeListHandler handler(ranges);
+    dwarf2reader::RangeListReader range_list_reader(reader_, cu_info,
+                                                    &handler);
+    return range_list_reader.ReadRanges(form, data);
+  }
+
+ private:
+  dwarf2reader::ByteReader* reader_;
+};
+
 // A line-to-module loader that accepts line number info parsed by
 // dwarf2reader::LineInfo and populates a Module and a line vector
 // with the results.
 class DumperLineToModule: public DwarfCUToModule::LineToModuleHandler {
  public:
   // Create a line-to-module converter using BYTE_READER.
-  explicit DumperLineToModule(dwarf2reader::ByteReader *byte_reader)
+  explicit DumperLineToModule(dwarf2reader::ByteReader* byte_reader)
       : byte_reader_(byte_reader) { }
   void StartCompilationUnit(const string& compilation_dir) {
     compilation_dir_ = compilation_dir;
   }
-  void ReadProgram(const uint8_t *program, uint64 length,
+  void ReadProgram(const uint8_t* program, uint64_t length,
+                   const uint8_t* string_section,
+                   uint64_t string_section_length,
+                   const uint8_t* line_string_section,
+                   uint64_t line_string_section_length,
                    Module* module, std::vector<Module::Line>* lines) {
     DwarfLineToModule handler(module, compilation_dir_, lines);
-    dwarf2reader::LineInfo parser(program, length, byte_reader_, &handler);
+    dwarf2reader::LineInfo parser(program, length, byte_reader_,
+                                  string_section, string_section_length,
+                                  line_string_section,
+                                  line_string_section_length,
+                                  &handler);
     parser.Start();
   }
  private:
   string compilation_dir_;
-  dwarf2reader::ByteReader *byte_reader_;
+  dwarf2reader::ByteReader* byte_reader_;
 };
 
 template<typename ElfClass>
@@ -256,27 +306,31 @@ bool LoadDwarf(const string& dwarf_filename,
     string name = GetOffset<ElfClass, char>(elf_header,
                                             section_names->sh_offset) +
                   section->sh_name;
-    const uint8_t *contents = GetOffset<ElfClass, uint8_t>(elf_header,
+    const uint8_t* contents = GetOffset<ElfClass, uint8_t>(elf_header,
                                                            section->sh_offset);
     file_context.AddSectionToSectionMap(name, contents, section->sh_size);
   }
+
+  // .debug_ranges and .debug_rnglists reader
+  DumperRangesHandler ranges_handler(&byte_reader);
 
   // Parse all the compilation units in the .debug_info section.
   DumperLineToModule line_to_module(&byte_reader);
   dwarf2reader::SectionMap::const_iterator debug_info_entry =
       file_context.section_map().find(".debug_info");
   assert(debug_info_entry != file_context.section_map().end());
-  const std::pair<const uint8_t *, uint64>& debug_info_section =
+  const std::pair<const uint8_t*, uint64_t>& debug_info_section =
       debug_info_entry->second;
   // This should never have been called if the file doesn't have a
   // .debug_info section.
   assert(debug_info_section.first);
-  uint64 debug_info_length = debug_info_section.second;
-  for (uint64 offset = 0; offset < debug_info_length;) {
+  uint64_t debug_info_length = debug_info_section.second;
+  for (uint64_t offset = 0; offset < debug_info_length;) {
     // Make a handler for the root DIE that populates MODULE with the
     // data that was found.
     DwarfCUToModule::WarningReporter reporter(dwarf_filename, offset);
-    DwarfCUToModule root_handler(&file_context, &line_to_module, &reporter);
+    DwarfCUToModule root_handler(&file_context, &line_to_module,
+                                 &ranges_handler, &reporter);
     // Make a Dwarf2Handler that drives the DIEHandler.
     dwarf2reader::DIEDispatcher die_dispatcher(&root_handler);
     // Make a DWARF parser for the compilation unit at OFFSET.
@@ -344,7 +398,7 @@ bool LoadDwarfCFI(const string& dwarf_filename,
       dwarf2reader::ENDIANNESS_BIG : dwarf2reader::ENDIANNESS_LITTLE;
 
   // Find the call frame information and its size.
-  const uint8_t *cfi =
+  const uint8_t* cfi =
       GetOffset<ElfClass, uint8_t>(elf_header, section->sh_offset);
   size_t cfi_size = section->sh_size;
 
@@ -432,13 +486,13 @@ bool IsSameFile(const char* left_abspath, const string& right_path) {
 
 // Read the .gnu_debuglink and get the debug file name. If anything goes
 // wrong, return an empty string.
-string ReadDebugLink(const uint8_t *debuglink,
+string ReadDebugLink(const uint8_t* debuglink,
                      const size_t debuglink_size,
                      const bool big_endian,
                      const string& obj_file,
                      const std::vector<string>& debug_dirs) {
   // Include '\0' + CRC32 (4 bytes).
-  size_t debuglink_len = strlen(reinterpret_cast<const char *>(debuglink)) + 5;
+  size_t debuglink_len = strlen(reinterpret_cast<const char*>(debuglink)) + 5;
   debuglink_len = 4 * ((debuglink_len + 3) / 4);  // Round up to 4 bytes.
 
   // Sanity check.
@@ -460,7 +514,7 @@ string ReadDebugLink(const uint8_t *debuglink,
   for (it = debug_dirs.begin(); it < debug_dirs.end(); ++it) {
     const string& debug_dir = *it;
     debuglink_path = debug_dir + "/" +
-                     reinterpret_cast<const char *>(debuglink);
+                     reinterpret_cast<const char*>(debuglink);
 
     // There is the annoying case of /path/to/foo.so having foo.so as the
     // debug link file name. Thus this may end up opening /path/to/foo.so again,
@@ -534,7 +588,7 @@ class LoadSymbolsInfo {
 
   // Keeps track of which sections have been loaded so sections don't
   // accidentally get loaded twice from two different files.
-  void LoadedSection(const string &section) {
+  void LoadedSection(const string& section) {
     if (loaded_sections_.count(section) == 0) {
       loaded_sections_.insert(section);
     } else {
@@ -545,7 +599,7 @@ class LoadSymbolsInfo {
 
   // The ELF file and linked debug file are expected to have the same preferred
   // loading address.
-  void set_loading_addr(Addr addr, const string &filename) {
+  void set_loading_addr(Addr addr, const string& filename) {
     if (!has_loading_addr_) {
       loading_addr_ = addr;
       loaded_file_ = filename;
@@ -609,12 +663,20 @@ bool LoadSymbols(const string& obj_file,
   module->SetLoadAddress(loading_addr);
   info->set_loading_addr(loading_addr, obj_file);
 
+  // Allow filtering of extraneous debug information in partitioned libraries.
+  // Such libraries contain debug information for all libraries extracted from
+  // the same combined library, implying extensive duplication.
+  vector<Module::Range> address_ranges = GetPtLoadSegmentRanges<ElfClass>(
+      GetOffset<ElfClass, Phdr>(elf_header, elf_header->e_phoff),
+      elf_header->e_phnum);
+  module->SetAddressRanges(address_ranges);
+
   const Shdr* sections =
       GetOffset<ElfClass, Shdr>(elf_header, elf_header->e_shoff);
   const Shdr* section_names = sections + elf_header->e_shstrndx;
   const char* names =
       GetOffset<ElfClass, char>(elf_header, section_names->sh_offset);
-  const char *names_end = names + section_names->sh_size;
+  const char* names_end = names + section_names->sh_size;
   bool found_debug_info_section = false;
   bool found_usable_info = false;
 
@@ -794,7 +856,7 @@ bool LoadSymbols(const string& obj_file,
                                            names_end, elf_header->e_shnum);
       if (gnu_debuglink_section) {
         if (!info->debug_dirs().empty()) {
-          const uint8_t *debuglink_contents =
+          const uint8_t* debuglink_contents =
               GetOffset<ElfClass, uint8_t>(elf_header,
                                            gnu_debuglink_section->sh_offset);
           string debuglink_file =
@@ -881,6 +943,7 @@ bool SanitizeDebugFile(const typename ElfClass::Ehdr* debug_elf_header,
 template<typename ElfClass>
 bool InitModuleForElfClass(const typename ElfClass::Ehdr* elf_header,
                            const string& obj_filename,
+                           const string& obj_os,
                            scoped_ptr<Module>& module) {
   PageAllocator allocator;
   wasteful_vector<uint8_t> identifier(&allocator, kDefaultBuildIdSize);
@@ -890,15 +953,19 @@ bool InitModuleForElfClass(const typename ElfClass::Ehdr* elf_header,
     return false;
   }
 
-  const char *architecture = ElfArchitecture<ElfClass>(elf_header);
+  const char* architecture = ElfArchitecture<ElfClass>(elf_header);
   if (!architecture) {
     fprintf(stderr, "%s: unrecognized ELF machine architecture: %d\n",
             obj_filename.c_str(), elf_header->e_machine);
     return false;
   }
 
-  string name = google_breakpad::BaseName(obj_filename);
-  string os = "Linux";
+  char name_buf[NAME_MAX] = {};
+  std::string name = google_breakpad::ElfFileSoNameFromMappedFile(
+                         elf_header, name_buf, sizeof(name_buf))
+                         ? name_buf
+                         : google_breakpad::BaseName(obj_filename);
+
   // Add an extra "0" at the end.  PDB files on Windows have an 'age'
   // number appended to the end of the file identifier; this isn't
   // really used or necessary on other platforms, but be consistent.
@@ -906,7 +973,7 @@ bool InitModuleForElfClass(const typename ElfClass::Ehdr* elf_header,
   // This is just the raw Build ID in hex.
   string code_id = FileID::ConvertIdentifierToString(identifier);
 
-  module.reset(new Module(name, os, architecture, id, code_id));
+  module.reset(new Module(name, obj_os, architecture, id, code_id));
 
   return true;
 }
@@ -914,6 +981,7 @@ bool InitModuleForElfClass(const typename ElfClass::Ehdr* elf_header,
 template<typename ElfClass>
 bool ReadSymbolDataElfClass(const typename ElfClass::Ehdr* elf_header,
                             const string& obj_filename,
+                            const string& obj_os,
                             const std::vector<string>& debug_dirs,
                             const DumpOptions& options,
                             Module** out_module) {
@@ -922,7 +990,8 @@ bool ReadSymbolDataElfClass(const typename ElfClass::Ehdr* elf_header,
   *out_module = NULL;
 
   scoped_ptr<Module> module;
-  if (!InitModuleForElfClass<ElfClass>(elf_header, obj_filename, module)) {
+  if (!InitModuleForElfClass<ElfClass>(elf_header, obj_filename, obj_os,
+                                       module)) {
     return false;
   }
 
@@ -970,6 +1039,7 @@ namespace google_breakpad {
 // Not explicitly exported, but not static so it can be used in unit tests.
 bool ReadSymbolDataInternal(const uint8_t* obj_file,
                             const string& obj_filename,
+                            const string& obj_os,
                             const std::vector<string>& debug_dirs,
                             const DumpOptions& options,
                             Module** module) {
@@ -981,24 +1051,27 @@ bool ReadSymbolDataInternal(const uint8_t* obj_file,
   int elfclass = ElfClass(obj_file);
   if (elfclass == ELFCLASS32) {
     return ReadSymbolDataElfClass<ElfClass32>(
-        reinterpret_cast<const Elf32_Ehdr*>(obj_file), obj_filename, debug_dirs,
-        options, module);
+        reinterpret_cast<const Elf32_Ehdr*>(obj_file), obj_filename, obj_os,
+        debug_dirs, options, module);
   }
   if (elfclass == ELFCLASS64) {
     return ReadSymbolDataElfClass<ElfClass64>(
-        reinterpret_cast<const Elf64_Ehdr*>(obj_file), obj_filename, debug_dirs,
-        options, module);
+        reinterpret_cast<const Elf64_Ehdr*>(obj_file), obj_filename, obj_os,
+        debug_dirs, options, module);
   }
 
   return false;
 }
 
-bool WriteSymbolFile(const string &obj_file,
+bool WriteSymbolFile(const string& load_path,
+                     const string& obj_file,
+                     const string& obj_os,
                      const std::vector<string>& debug_dirs,
                      const DumpOptions& options,
-                     std::ostream &sym_stream) {
+                     std::ostream& sym_stream) {
   Module* module;
-  if (!ReadSymbolData(obj_file, debug_dirs, options, &module))
+  if (!ReadSymbolData(load_path, obj_file, obj_os, debug_dirs, options,
+                      &module))
     return false;
 
   bool result = module->Write(sym_stream, options.symbol_data);
@@ -1009,11 +1082,13 @@ bool WriteSymbolFile(const string &obj_file,
 // Read the selected object file's debugging information, and write out the
 // header only to |stream|. Return true on success; if an error occurs, report
 // it and return false.
-bool WriteSymbolFileHeader(const string& obj_file,
-                           std::ostream &sym_stream) {
+bool WriteSymbolFileHeader(const string& load_path,
+                           const string& obj_file,
+                           const string& obj_os,
+                           std::ostream& sym_stream) {
   MmapWrapper map_wrapper;
   void* elf_header = NULL;
-  if (!LoadELF(obj_file, &map_wrapper, &elf_header)) {
+  if (!LoadELF(load_path, &map_wrapper, &elf_header)) {
     fprintf(stderr, "Could not load ELF file: %s\n", obj_file.c_str());
     return false;
   }
@@ -1027,13 +1102,15 @@ bool WriteSymbolFileHeader(const string& obj_file,
   scoped_ptr<Module> module;
   if (elfclass == ELFCLASS32) {
     if (!InitModuleForElfClass<ElfClass32>(
-        reinterpret_cast<const Elf32_Ehdr*>(elf_header), obj_file, module)) {
+        reinterpret_cast<const Elf32_Ehdr*>(elf_header), obj_file, obj_os,
+        module)) {
       fprintf(stderr, "Failed to load ELF module: %s\n", obj_file.c_str());
       return false;
     }
   } else if (elfclass == ELFCLASS64) {
     if (!InitModuleForElfClass<ElfClass64>(
-        reinterpret_cast<const Elf64_Ehdr*>(elf_header), obj_file, module)) {
+        reinterpret_cast<const Elf64_Ehdr*>(elf_header), obj_file, obj_os,
+        module)) {
       fprintf(stderr, "Failed to load ELF module: %s\n", obj_file.c_str());
       return false;
     }
@@ -1045,17 +1122,19 @@ bool WriteSymbolFileHeader(const string& obj_file,
   return module->Write(sym_stream, ALL_SYMBOL_DATA);
 }
 
-bool ReadSymbolData(const string& obj_file,
+bool ReadSymbolData(const string& load_path,
+                    const string& obj_file,
+                    const string& obj_os,
                     const std::vector<string>& debug_dirs,
                     const DumpOptions& options,
                     Module** module) {
   MmapWrapper map_wrapper;
   void* elf_header = NULL;
-  if (!LoadELF(obj_file, &map_wrapper, &elf_header))
+  if (!LoadELF(load_path, &map_wrapper, &elf_header))
     return false;
 
   return ReadSymbolDataInternal(reinterpret_cast<uint8_t*>(elf_header),
-                                obj_file, debug_dirs, options, module);
+                                obj_file, obj_os, debug_dirs, options, module);
 }
 
 }  // namespace google_breakpad
