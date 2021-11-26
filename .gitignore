@@ -416,3 +416,5 @@ utils/DXFiles/
 !*.dll
 !*.exe
 utils/vswhere.exe
+
+temp_resources.zip
